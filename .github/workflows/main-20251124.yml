@@ -1,0 +1,131 @@
+name: Build wiliwili (Only NRO)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      ssh_ubuntu:
+        description: 'SSH connection to Ubuntu'
+        required: false
+        default: 'false'
+      release:
+        description: 'Push new release'
+        required: false
+        default: 'true'
+      disable_unity_build:
+        description: 'Disable unity build'
+        required: false
+        default: 'false'
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.extract-version.outputs.version }}
+      DIST_NRO: ${{ steps.extract-version.outputs.DIST_NRO }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Extract version from CMakeLists.txt
+        id: extract-version
+        run: |
+          VERSION_MAJOR=$(grep -oP 'set\(VERSION_MAJOR "\K[^"]+' CMakeLists.txt)
+          VERSION_MINOR=$(grep -oP 'set\(VERSION_MINOR "\K[^"]+' CMakeLists.txt)
+          VERSION_REVISION=$(grep -oP 'set\(VERSION_REVISION "\K[^"]+' CMakeLists.txt)
+          VERSION="${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_REVISION}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "DIST_NRO=wiliwili-NintendoSwitch-${VERSION}" >> $GITHUB_OUTPUT
+          echo "Extracted version: ${VERSION}"
+
+  build-switch:
+    needs: [version]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { driver: opengl, suffix: "", nro_name: "wiliwili-opengl.nro" }
+          - { driver: deko3d, suffix: "_deko3d", nro_name: "wiliwili-deko3d.nro" }
+        driver: [opengl, deko3d]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: SSH connection
+        uses: P3TERX/ssh2actions@v1.0.0
+        if: github.event.inputs.ssh_ubuntu == 'true'
+        env:
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
+      - name: Disable unity build
+        if: github.event.inputs.disable_unity_build == 'true'
+        run: |
+          sed -i 's/BRLS_UNITY_BUILD=ON/BRLS_UNITY_BUILD=OFF/' scripts/build_switch${{ matrix.suffix }}.sh
+
+      - name: Build NRO
+        run: |
+          docker run --rm -v $(pwd):/data devkitpro/devkita64:latest bash -c "/data/scripts/build_switch${{ matrix.suffix }}.sh"
+
+      - name: Rename NRO
+        run: |
+          mkdir -p cmake-build-switch
+          sudo chown -R $USER:$USER cmake-build-switch/
+          mv cmake-build-switch/wiliwili.nro cmake-build-switch/${{ matrix.nro_name }}
+
+      - name: Upload NRO
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.nro_name }}
+          path: "cmake-build-switch/${{ matrix.nro_name }}"
+          retention-days: 90
+
+  release-nro:
+    needs: [version, build-switch]
+    runs-on: ubuntu-latest
+    if: github.event.inputs.release == 'true' || github.ref == 'refs/heads/yoga'
+    steps:
+      - name: Download NRO
+        uses: actions/download-artifact@v4
+        with:
+          path: ./nro-files
+          pattern: "wiliwili-*.nro"
+          merge-multiple: true
+
+      - name: Upload to Release
+        uses: ncipollo/release-action@v1
+        with:
+          name: wiliwili Switch v${{ needs.version.outputs.version }}
+          tag: v${{ needs.version.outputs.version }}
+          makeLatest: true
+          omitBodyDuringUpdate: true
+          body: |
+            wiliwili Nintendo Switch NRO 最新构建版本
+            版本号：v${{ needs.version.outputs.version }}
+            包含文件（直接下载使用）：
+            - wiliwili-opengl.nro（OpenGL 驱动，兼容性优先，老设备/老CFW首选）
+            - wiliwili-deko3d.nro（Deko3D 驱动，性能优先，新设备/大气层1.0+首选）
+            
+            补充说明（帮你避坑）：
+            为什么会有两个版本？Switch 虽然支持 OpenGL ES 标准接口，但任天堂自己的第一方游戏（如《塞尔达》）都用 Deko3D 开发 ——Deko3D 是为 Switch 硬件量身定制的，能发挥更强的 GPU 性能；而 OpenGL 是通用标准，兼容性更好但有性能损耗。wiliwili 提供两个版本，是为了「兼顾所有用户」：既让老设备 / 老系统用户能用，也让新设备用户能享受到更好的性能。
+            怎么判断自己该用哪个？
+            优先试 Deko3D 版本：如果你的 CFW 是「大气层 1.0 以上」（目前主流都是），直接用这个，视频播放、弹幕滚动会更流畅；
+            若 Deko3D 版本打开报错（如黑屏、闪退），再换 OpenGL 版本：大概率是你的 CFW 太老，或设备不支持 Deko3D 驱动，OpenGL 版本是「万能兜底」选项。
+            功能上有差异吗？完全没有！两个版本的核心功能（视频解析、弹幕、登录、收藏、画质调节等）完全一致，仅图形渲染后端不同 —— 简单说就是「同一个 app，用两种不同的『显卡驱动』来显示画面」。
+            总结：
+            追求性能、设备 / 系统较新 → 选 Deko3D 版本（wiliwili-deko3d.nro）；
+            追求稳定、设备 / 系统较老 → 选 OpenGL 版本（wiliwili-opengl.nro）；
+            不确定就两个都试：哪个能正常运行且流畅，就用哪个～
+            
+            默认提供的switch安装包为 OpenGL 版本，最高只能播放 4k@30，
+            你也可以下载到支持原生图形 api 的 可以流畅播放 4k@60，不过可能会偶尔崩溃。
+          token: ${{ secrets.GITHUB_TOKEN }}
+          allowUpdates: true
+          artifacts: "./nro-files/*.nro"
